@@ -7,23 +7,23 @@ from dotenv import load_dotenv
 from supabase import create_client
 from openai import OpenAI
 
-# Load environment
+# Load env
 load_dotenv()
 
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
 SUPABASE_SERVICE_ROLE_KEY = os.environ.get("SUPABASE_SERVICE_ROLE_KEY") or os.environ.get("SUPABASE_SERVICE_KEY")
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
-OCR_DOC_ID = os.environ.get("OCR_DOC_ID")  # set this in Railway env vars
+OCR_DOC_ID = os.environ.get("OCR_DOC_ID")  # set in Railway
 
 if not (SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY and OPENAI_API_KEY):
-    raise SystemExit("Missing SUPABASE_URL / SERVICE_ROLE_KEY / OPENAI_API_KEY in environment vars")
+    raise SystemExit("Missing SUPABASE_URL / SERVICE_ROLE_KEY / OPENAI_API_KEY")
 
 sb = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
 oa = OpenAI(api_key=OPENAI_API_KEY)
 
 app = FastAPI(title="Agreement Q&A API")
 
-# 🔓 CORS so your WordPress site can call this API
+# CORS for your WP site
 ALLOWED_ORIGINS = os.environ.get("ALLOWED_ORIGINS", "*").split(",")
 app.add_middleware(
     CORSMiddleware,
@@ -53,13 +53,23 @@ def retrieve_hybrid(query_text: str, top_k: int = 12, doc_id: Optional[str] = No
     return res.data or []
 
 def format_context(chunks: List[Dict]) -> str:
+    """
+    Show FULL text for the best 2 chunks (so tables like 'RATES OF PAY' are visible),
+    then lightly trim the rest to keep requests reasonable.
+    """
     lines = []
     for i, c in enumerate(chunks, start=1):
         page_note = f"Pages {c['page_start']}–{c['page_end']}"
         section_note = f" | Section: {c['section']}" if c.get("section") else ""
         text = c["content"]
-        if len(text) > 1400:
-            text = text[:1400] + "…"
+
+        # keep top 2 full; trim later ones a bit
+        if i > 2 and len(text) > 1800:
+            # try to keep tail of chunk too (tables often sit near the end)
+            head = text[:900]
+            tail = text[-900:]
+            text = head + "\n...\n" + tail
+
         lines.append(f"[Chunk {i} | {page_note}{section_note}]\n{text}")
     return "\n\n".join(lines)
 
@@ -67,16 +77,17 @@ def answer_with_citations(question: str, chunks: List[Dict]) -> str:
     context = format_context(chunks)
     system = (
         "You are a contracts assistant. Answer ONLY using the provided agreement excerpts. "
-        "If the answer is not in the excerpts, say 'Not found in the agreement excerpts provided.' "
-        "Always include citations like (Pages X–Y) after each sentence. Quote exact lines when possible."
+        "If the answer truly is not in the excerpts, say 'Not found in the agreement excerpts provided.' "
+        "If you see a 'RATES OF PAY' table or similar, read the specific row for the classification asked. "
+        "Always include page-range citations like (Pages X–Y) after each sentence. Quote exact lines when possible."
     )
     user = (
         f"Agreement excerpts:\n\n{context}\n\n"
         f"Question: {question}\n\n"
         "Instructions:\n"
         "1) Be concise and factual.\n"
-        "2) Use bullets if more than one rule applies.\n"
-        "3) Add (Pages X–Y) after each sentence."
+        "2) If the answer involves a pay rate, extract the numeric value and the effective date from the table/header.\n"
+        "3) Add (Pages X–Y) at the end of each sentence."
     )
     resp = oa.chat.completions.create(
         model="gpt-4o-mini",
@@ -91,7 +102,7 @@ def root():
 
 @app.post("/ask")
 def ask(body: AskBody):
-    hits = retrieve_hybrid(body.question, top_k=min(max(body.top_k, 4), 20), doc_id=OCR_DOC_ID)
+    hits = retrieve_hybrid(body.question, top_k=min(max(body.top_k, 6), 20), doc_id=OCR_DOC_ID)
     if not hits:
         return {"answer": "Not found in the agreement excerpts provided.", "citations": [], "chunks": []}
     answer = answer_with_citations(body.question, hits[:8])
